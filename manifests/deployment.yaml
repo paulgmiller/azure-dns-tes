@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azurednstest
+  labels:
+    app: azurednstest
+    kubernetes.azure.com/generator: draft
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: azurednstest
+  template:
+    metadata:
+      labels:
+        app: azurednstest
+    spec:
+      containers:
+        - name: azurednstest
+          image: paulgmiller/azurednstest:latest
+          imagePullPolicy: Always
+          env: 
+          - name: ACCESS_TOKEN
+            value: "put the token from az account get-access-token --resource https://management.azure.com/ here"
