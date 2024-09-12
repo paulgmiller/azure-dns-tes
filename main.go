@@ -2,155 +2,135 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
-	"net"
 	"os"
-	"strings"
-	"time"
 
-	"math/rand"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/privatedns/armprivatedns"
-	"github.com/Azure/go-autorest/autorest/to"
 )
 
-type CustomTokenCredential struct {
-	token string
-}
-
-func (c *CustomTokenCredential) GetToken(ctx context.Context, options policy.TokenRequestOptions) (azcore.AccessToken, error) {
-	return azcore.AccessToken{
-		Token:     c.token,
-		ExpiresOn: time.Now().Add(1 * time.Hour), // Set an appropriate expiration time
-	}, nil
-}
-
-// NewCustomTokenCredential creates a new CustomTokenCredential
-func NewCustomTokenCredential(token string) *CustomTokenCredential {
-	return &CustomTokenCredential{token: token}
-}
-
-const (
-	letters        = "abcdefghijklmnopqrstuvwxyz"
-	hostnameLength = 10
+var (
+	subscriptionID     = os.Getenv("AZURE_SUBSCRIPTION_ID")
+	resourceGroupName  = os.Getenv("AZURE_RESOURCE_GROUP")
+	privateDNSZoneName = os.Getenv("AZURE_PRIVATE_DNS_ZONE")
 )
-
-func generateRandomHostname() string {
-	rand.Seed(time.Now().UnixNano())
-	var sb strings.Builder
-	for i := 0; i < hostnameLength; i++ {
-		sb.WriteByte(letters[rand.Intn(len(letters))])
-	}
-	return sb.String()
-}
 
 func main() {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
 
-	var cred azcore.TokenCredential
-	if token, found := os.LookupEnv("ACCESS_TOKEN"); found {
-		cred = NewCustomTokenCredential(token)
-	} else {
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		Scheme: scheme,
+	})
+	if err != nil {
+		log.Fatalf("Unable to start manager: %v", err)
+	}
 
-		var err error
-		cred, err = azidentity.NewAzureCLICredential(nil)
-		if err != nil {
-			log.Fatal(err.Error())
+	if err = (&ServiceReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		log.Fatalf("Unable to create controller: %v", err)
+	}
+
+	log.Println("Starting manager")
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+		log.Fatalf("Problem running manager: %v", err)
+	}
+}
+
+// ServiceReconciler reconciles a Service object
+type ServiceReconciler struct {
+	client.Client
+	Scheme    *runtime.Scheme
+	DNSClient *armprivatedns.RecordSetsClient
+}
+
+// Reconcile updates the Azure Private DNS Zone based on the Service changes
+func (r *ServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var svc corev1.Service
+	if err := r.Get(ctx, req.NamespacedName, &svc); err != nil {
+		if errors.IsNotFound(err) {
+			// Service deleted; remove DNS record
+			recordName := fmt.Sprintf("%s.%s", req.Name, req.Namespace)
+			_, err = r.DNSClient.Delete(ctx, resourceGroupName, privateDNSZoneName, armprivatedns.RecordTypeA, recordName, nil)
+			if err != nil {
+				return ctrl.Result{}, client.IgnoreNotFound(err)
+			}
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	// Collect IP addresses from the Service
+	var ipAddresses []string
+	if svc.Spec.Type == corev1.ServiceTypeClusterIP {
+		if svc.Spec.ClusterIP != "" && svc.Spec.ClusterIP != "None" {
+			ipAddresses = append(ipAddresses, svc.Spec.ClusterIP)
+		}
+	} else if svc.Spec.Type == corev1.ServiceTypeLoadBalancer {
+		for _, ingress := range svc.Status.LoadBalancer.Ingress {
+			if ingress.IP != "" {
+				ipAddresses = append(ipAddresses, ingress.IP)
+			}
 		}
 	}
-	options := arm.ClientOptions{}
-	clientFactory, err := armprivatedns.NewClientFactory("8ecadfc9-d1a3-4ea4-b844-0d9f87e4d7c8", cred, &options)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-	ctx := context.Background()
 
-	zoneclient := clientFactory.NewPrivateZonesClient()
-	location := "global"
-	rg := "paultest"
-	zone := "dnstest.cluster.local"
-
-	poller, err := zoneclient.BeginCreateOrUpdate(ctx, rg, zone, armprivatedns.PrivateZone{
-		Location:   &location,
-		Properties: &armprivatedns.PrivateZoneProperties{},
-	}, &armprivatedns.PrivateZonesClientBeginCreateOrUpdateOptions{})
-	if err != nil {
-		log.Fatal(err.Error())
+	if len(ipAddresses) == 0 {
+		// No IPs to update; skip
+		return ctrl.Result{}, nil
 	}
-	_, err = poller.Poll(ctx)
-	if err != nil {
-		log.Fatal(err.Error())
-	}
-	//log.Printf("got %+v", resp)
 
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{
-				Timeout: time.Second * 2,
-			}
-			// Specify the DNS server here
-			return d.DialContext(ctx, network, "168.63.129.16:53") // Google's DNS server
+	// Update Azure Private DNS
+	recordName := fmt.Sprintf("%s.%s", svc.Name, svc.Namespace)
+	ttl := int64(300)
+	aRecords := make([]*armprivatedns.ARecord, len(ipAddresses))
+	for i, ip := range ipAddresses {
+		aRecords[i] = &armprivatedns.ARecord{IPv4Address: &ip}
+	}
+	aRecordSet := armprivatedns.RecordSet{
+		Properties: &armprivatedns.RecordSetProperties{
+			TTL:      &ttl,
+			ARecords: aRecords,
 		},
 	}
 
-	rc := clientFactory.NewRecordSetsClient()
-
-	runs := 1000
-	var semaphor = make(chan bool, 10)
-	var results = make(chan time.Duration, runs)
-	for count := 0; count < runs; count++ {
-		go func() {
-			semaphor <- true
-			defer func() { <-semaphor }()
-			recordname := generateRandomHostname()
-			_, err := rc.CreateOrUpdate(ctx, rg, zone, armprivatedns.RecordTypeA, recordname, armprivatedns.RecordSet{
-				Properties: &armprivatedns.RecordSetProperties{
-					TTL: to.Int64Ptr(60),
-					ARecords: []*armprivatedns.ARecord{
-						{
-							IPv4Address: to.StringPtr("10.0.1.4"),
-						},
-					},
-				},
-			}, &armprivatedns.RecordSetsClientCreateOrUpdateOptions{})
-			if err != nil {
-				log.Fatal(err.Error())
-			}
-			//log.Printf("got %s =  %+v from arm call", *recordresp.Name, *recordresp.Properties)
-
-			start := time.Now()
-
-			for i := 0; i < 30; i++ {
-				resp, err := resolver.LookupHost(context.TODO(), recordname+"."+zone)
-				if err != nil {
-					if de, ok := err.(*net.DNSError); ok && de.IsNotFound {
-						//log.Printf("Got nxrecord")
-						time.Sleep(time.Second / 2)
-						continue
-					}
-					log.Fatalf("failed to lookup host %s: %s", recordname, err)
-				}
-				latency := time.Since(start)
-				log.Printf("got %s-> %v after %s", recordname, resp, latency)
-				results <- latency
-				break
-			}
-		}()
+	_, err := r.DNSClient.CreateOrUpdate(
+		ctx,
+		resourceGroupName,
+		privateDNSZoneName,
+		armprivatedns.RecordTypeA,
+		recordName,
+		aRecordSet,
+		nil,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
-	var total, max time.Duration
-	for count := 0; count < runs; count++ {
-		l := <-results
-		total += l
-		if l > max {
-			max = l
-		}
-	}
-	average := total / time.Duration(runs)
-	log.Printf("Got averge %s and max %s", average, max)
+	return ctrl.Result{}, nil
+}
 
+// SetupWithManager initializes the controller and sets up the Azure Private DNS client
+func (r *ServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
+	if err != nil {
+		return err
+	}
+	dnsClient, err := armprivatedns.NewRecordSetsClient(subscriptionID, cred, nil)
+	if err != nil {
+		return err
+	}
+	r.DNSClient = dnsClient
+
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&corev1.Service{}).
+		Complete(r)
 }
